@@ -1,1 +1,1 @@
-# Redis rewrite in Go way.
+# Rewrites Redis in Go way.
