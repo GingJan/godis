@@ -33,14 +33,27 @@ type dictType struct {
 type dict struct {
 	typei dictType
 
-	ht_table [2][]*dictEntry
+	httable *[2]int
+	ht_table [2]*[]*dictEntry//TODO ht_table[0] = [(1<<exp)]*dictEntry，用切片代替未定大小的数组
 	ht_used  [2]uint64 //[]*dictEntry已用个数
 
 	rehashidx int64 /* rehashing not in progress if rehashidx == -1 */
 
 	/* Keep small vars at end for optimal (minimal) struct padding */
 	pauserehash int16_t /* 如果>0，则rehash暂停了，（<0代表程序写错了） */
-	ht_size_exp [2]int8 /* exponent of size. (size = 1<<exp) */
+	ht_size_exp [2]int8 /* 空间大小的指数值，比如3代表有2^3的大小 (size = 1<<exp) */
+}
+
+/* 如果safe字段置为1，表示该iterator是安全的，也即当字典dict在遍历迭代时，对该字典调用dictAdd，dictFind和其他函数都是安全的。
+否则就表示该iterator是不安全的，这样在遍历迭代时只能调用dictNext()
+*/
+type dictIterator struct {
+	d *dict
+	index int64
+	table, safe int
+	entry, nextEntry *dictEntry
+	/* unsafe iterator fingerprint for misuse detection. */
+	fingerprint uint64
 }
 
 type dictEntry struct {
@@ -109,5 +122,13 @@ func DICTHT_SIZE_MASK(exp int8) uint64 {
 
 	return DICTHT_SIZE(exp) - 1
 }
+
+func dictPauseRehashing(d *dict) {
+	d.pauserehash++
+}
+
+func dictResumeRehashing(d *dict) {
+	d.pauserehash--
+})
 
 /***** C里的宏指令 ********/

@@ -194,7 +194,9 @@ func (d *dict) elasticThreshold(loadFactor, incr, decr float64) int8 {
 	}
 }
 
-/* 删除一个元素，是dictDelete()和dictUnlink()的辅助函数，请查阅这两函数的注释 */
+/* 删除一个元素，是dictDelete()和dictUnlink()的辅助函数，请查阅这两函数的注释
+本函数会先遍历查找key对应的entry，然后再删除之。
+*/
 func dictGenericDelete(d *dict, key unsafe.Pointer, nofree bool) *dictEntry {
 	var h, idx uint64_t
 	var he, prevHe *dictEntry
@@ -212,7 +214,7 @@ func dictGenericDelete(d *dict, key unsafe.Pointer, nofree bool) *dictEntry {
 	h = dictHashKey(d, key) //计算key的hash值
 	for table = 0; table <= 1; table++ {
 		idx = h & DICTHT_SIZE_MASK(d.ht_size_exp[table])
-		he = d.ht_table[table][idx]
+		he = (*(d.ht_table[table]))[idx]
 		prevHe = nil
 		for he != nil {
 			if key == he.key || dictCompareKeys(d, key, he.key) {
@@ -220,7 +222,7 @@ func dictGenericDelete(d *dict, key unsafe.Pointer, nofree bool) *dictEntry {
 				if prevHe != nil {
 					prevHe.next = he.next
 				} else {
-					d.ht_table[table][idx] = he.next
+					(*(d.ht_table[table]))[idx] = he.next
 				}
 
 				if !nofree { //需要释放被删元素的占用空间
@@ -243,9 +245,11 @@ func dictGenericDelete(d *dict, key unsafe.Pointer, nofree bool) *dictEntry {
 	return nil /* not found */
 }
 
-/* 从ht里删除并释放 key，成功返回DICT_OK，元素找不到则返回 DICT_ERR */
+/* 从ht里删除并释放 key，成功返回DICT_OK，元素找不到则返回 DICT_ERR
+本函数会先查找key对应的entry，然后再删除之。
+*/
 func dictDelete(ht *dict, key unsafe.Pointer) int {
-	if dictGenericDelete(ht, key, false) != nil { //
+	if dictGenericDelete(ht, key, false) != nil { //dictGenericDelete函数会先遍历查找key对应的entry，然后再删除之。
 		return DICT_OK
 	}
 
@@ -268,7 +272,7 @@ func dictFreeUnlinkedEntry(d *dict, he *dictEntry) {
 	zfree(unsafe.Pointer(he)) //把he释放
 }
 
-/* 摧毁一整个dict字典 */
+/* 摧毁一整个dict字典，htidx只可传0（旧ht）和1（新ht） */
 func _dictClear(d *dict, htidx int, callback func(*dict)) int {
 	var i uint64
 
@@ -280,7 +284,7 @@ func _dictClear(d *dict, htidx int, callback func(*dict)) int {
 			callback(d)
 		}
 
-		he = d.ht_table[htidx][i]
+		he = (*(d.ht_table[htidx]))[i]
 		if he == nil {
 			continue
 		}
@@ -326,7 +330,7 @@ func dictFind(d *dict, key unsafe.Pointer) *dictEntry {
 	h = dictHashKey(d, key) //计算key的hash值
 	for table = 0; table <= 1; table++ {
 		idx = h & DICTHT_SIZE_MASK(d.ht_size_exp[table])
-		he = d.ht_table[table][idx]
+		he = (*(d.ht_table[table]))[idx]
 		for he != nil {
 			if key == he.key || dictCompareKeys(d, key, he.key) { //是要找的key
 				return he //返回key对应的entry
@@ -343,6 +347,7 @@ func dictFind(d *dict, key unsafe.Pointer) *dictEntry {
 	return nil
 }
 
+//获取key对应的val
 func dictFetchValue(d *dict, key unsafe.Pointer) unsafe.Pointer {
 	he := dictFind(d, key)
 	if he != nil {
@@ -351,6 +356,114 @@ func dictFetchValue(d *dict, key unsafe.Pointer) unsafe.Pointer {
 	return nil
 }
 
+/* 从ht里查找元素，若找到元素则返回对应entry，接着调用者应调用`dictTwoPhaseUnlinkFree`函数以unlink和释放该entry。
+若找不到该元素则返回nil。plink存放的是对应entry的指针。
+本函数和`dictTwoPhaseUnlinkFree`应一起成对调用，`dictTwoPhaseUnlinkFind`暂停rehash而`dictTwoPhaseUnlinkFree`恢复rehash
+
+可按照以下方式使用：
+var de *dictEntry = dictTwoPhaseUnlinkFind(db.dict,key.ptr,&plink, &table)
+//其他代码（但不能修改dict）
+dictTwoPhaseUnlinkFree(db.dict,de,plink,table); // 不需要再去找一次
+这两函数配合起来，就是先找到要删元素，使用元素，然后删除元素
+
+如果想要再删除某个entry前先查找出来，可按以上示例使用，这样避免先dictFind()再dictDelete()（因为这两函数都会有寻找entry的过程，寻找重复做了两次）
+*/
+func dictTwoPhaseUnlinkFind(d *dict, key unsafe.Pointer, plink ***dictEntry, table_index *int) *dictEntry {
+	var h, idx, table uint64_t
+
+	if dictSize(d) == 0 { /* dict is empty */
+		return nil
+	}
+
+	//进行渐进式rehash
+	if dictIsRehashing(d) {
+		_dictRehashStep(d)
+	}
+
+	h = dictHashKey(d, key)
+	//遍历查找key对应entry
+	for table = 0; table <= 1; table++ {
+		idx = h & DICTHT_SIZE_MASK(d.ht_size_exp[table])
+		var ref **dictEntry = &((*(d.ht_table[table]))[idx])
+		for *ref != nil {
+			if key == (*ref).key || dictCompareKeys(d, key, (*ref).key) {
+				*table_index = int(table)
+				*plink = ref
+				dictPauseRehashing(d) //暂停rehash
+				return *ref
+			}
+			ref = &(*ref).next
+		}
+
+		if !dictIsRehashing(d) { //如果不在进行rehash，则无需遍历ht_table[1]了
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// 把he从d里移除并释放he的空间
+func dictTwoPhaseUnlinkFree(d *dict, he *dictEntry, plink **dictEntry, table_index int) {
+	if he == nil {
+		return
+	}
+
+	d.ht_used[table_index]--
+	*plink = he.next
+
+	dictFreeKey(d, he)
+	dictFreeVal(d, he)
+	zfree(unsafe.Pointer(he))
+	dictResumeRehashing(d) //恢复rehash
+}
+
+/* 返回的64位fingerprint数字表示dict字典在指定时间的状态，由几个dict的字段通过 异或 运算得出，
+ * at a given time, it's just a few dict properties xored together.
+ * When an unsafe iterator is initialized, we get the dict fingerprint, and check
+ * the fingerprint again when the iterator is released.
+ * If the two fingerprints are different it means that the user of the iterator
+ * performed forbidden operations against the dictionary while iterating. */
+func dictFingerprint(d *dict) uint64 {
+	var integers [6]uint64
+	var j int
+
+	integers[0] = uint64(uintptr(unsafe.Pointer(d.ht_table[0])))
+	integers[1] = uint64(d.ht_size_exp[0])
+	integers[2] = d.ht_used[0]
+	integers[3] = uint64(uintptr(unsafe.Pointer(d.ht_table[1])))
+	integers[4] = uint64(d.ht_size_exp[1])
+	integers[5] = d.ht_used[1]
+
+	/* 使用类似以下公式计算最后的hash值:
+	 * Result = hash(hash(hash(int1)+int2)+int3) ...
+	 * 几个hash的顺序不同，得出的最终hash值也不同
+	 */
+	var hash uint64 = 0
+	for j = 0; j < 6; j++ {
+		hash += integers[j]
+		/* For the hashing step we use Tomas Wang's 64 bit integer hash. */
+		hash = (^hash) + (hash << 21) // hash = (hash << 21) - hash - 1;
+		hash = hash ^ (hash >> 24)
+		hash = (hash + (hash << 3)) + (hash << 8) // hash * 265
+		hash = hash ^ (hash >> 14)
+		hash = (hash + (hash << 2)) + (hash << 4) // hash * 21
+		hash = hash ^ (hash >> 28)
+		hash = hash + (hash << 31)
+	}
+	return hash
+}
+
+func dictInitIterator(iter *dictIterator, d *dict) {
+	iter.d = d
+	iter.table = 0
+	iter.index = -1
+	iter.safe = 0
+	iter.entry = nil
+	iter.nextEntry = nil
+}
+
+//执行渐进式rehash
 func _dictRehashStep(d *dict) {
 	if d.pauserehash == 0 {
 		dictRehash(d, 1)
