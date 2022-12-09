@@ -50,10 +50,11 @@ type dict struct {
 type dictIterator struct {
 	d *dict
 	index int64
-	table, safe int
-	entry, nextEntry *dictEntry
+	table int//取值0 或 1
+	safe bool
+	entry, nextEntry *dictEntry//迭代器当前指向的entry和下一个entry
 	/* unsafe iterator fingerprint for misuse detection. */
-	fingerprint uint64
+	fingerprint uint64//当前字典d的指纹
 }
 
 type dictEntry struct {
@@ -107,7 +108,7 @@ func dictGetVal(he *dictEntry) unsafe.Pointer {
 	return he.v.val
 }
 
-func DICTHT_SIZE(exp int8) uint64 {
+func DICTHT_SIZE(exp int8) uint64 {//返回字典的实际大小，由exp计算得出
 	if exp == -1 {
 		return 0
 	}

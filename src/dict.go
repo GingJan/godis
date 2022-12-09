@@ -454,13 +454,125 @@ func dictFingerprint(d *dict) uint64 {
 	return hash
 }
 
+//初始化iterator
 func dictInitIterator(iter *dictIterator, d *dict) {
 	iter.d = d
 	iter.table = 0
 	iter.index = -1
-	iter.safe = 0
+	iter.safe = false
 	iter.entry = nil
 	iter.nextEntry = nil
+}
+
+func dictInitSafeIterator(iter *dictIterator, d *dict) {
+	dictInitIterator(iter, d) //初始化
+	iter.safe = true
+}
+
+func dictResetIterator(iter *dictIterator) {
+	if !(iter.index == -1 && iter.table == 0) {
+		if iter.safe {
+			dictResumeRehashing(iter.d)
+		} else {
+			assert(iter.fingerprint == dictFingerprint(iter.d), "iter.fingerprint == dictFingerprint(iter.d)")
+		}
+	}
+}
+
+func dictGetIterator(d *dict) *dictIterator {
+	iter := dictIterator{}
+	dictInitIterator(&iter, d)
+	return &iter
+}
+
+func dictGetSafeIterator(d *dict) *dictIterator {
+	i := dictGetIterator(d)
+	i.safe = true
+	return i
+}
+
+func dictNext(iter *dictIterator) *dictEntry {
+	for {
+		if iter.entry == nil {//iterator第一次迭代
+			if iter.index == -1 && iter.table == 0 {//第一次迭代
+				if iter.safe {//安全模式的iterator
+					dictPauseRehashing(iter.d)//暂停字典的rehash
+				} else {
+					iter.fingerprint = dictFingerprint(iter.d)//获取当前字典的指纹
+				}
+			}
+
+			iter.index++
+			if iter.index >= int64(DICTHT_SIZE(iter.d.ht_size_exp[iter.table])) {//如果在迭代时，字典的大小发生变化，说明可能正在rehash。否则就是遍历完毕
+				if dictIsRehashing(iter.d) && iter.table == 0 {//字典正在rehash
+					iter.table++//则去迭代新的table
+					iter.index = 0//从新table的0开始迭代
+				} else {
+					break//字典遍历完毕
+				}
+			}
+
+			iter.entry = (*(iter.d.ht_table[iter.table]))[iter.index]//新table的entry
+		} else {
+			iter.entry = iter.nextEntry//指向到原table的下一个entry
+		}
+
+		if iter.entry != nil {
+			/* 保存entry指向的下一个entry，因为返回的entry可能会被调用者删除 */
+			iter.nextEntry = iter.entry.next
+			return iter.entry
+		}
+	}
+
+	return nil
+}
+
+void dictReleaseIterator(dictIterator *iter)
+{
+dictResetIterator(iter);
+zfree(iter);
+}
+
+/* Return a random entry from the hash table. Useful to
+ * implement randomized algorithms */
+dictEntry *dictGetRandomKey(dict *d)
+{
+dictEntry *he, *orighe;
+unsigned long h;
+int listlen, listele;
+
+if (dictSize(d) == 0) return NULL;
+if (dictIsRehashing(d)) _dictRehashStep(d);
+if (dictIsRehashing(d)) {
+unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
+do {
+/* We are sure there are no elements in indexes from 0
+ * to rehashidx-1 */
+h = d->rehashidx + (randomULong() % (dictSlots(d) - d->rehashidx));
+he = (h >= s0) ? d->ht_table[1][h - s0] : d->ht_table[0][h];
+} while(he == NULL);
+} else {
+unsigned long m = DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+do {
+h = randomULong() & m;
+he = d->ht_table[0][h];
+} while(he == NULL);
+}
+
+/* Now we found a non empty bucket, but it is a linked
+ * list and we need to get a random element from the list.
+ * The only sane way to do so is counting the elements and
+ * select a random index. */
+listlen = 0;
+orighe = he;
+while(he) {
+he = he->next;
+listlen++;
+}
+listele = random() % listlen;
+he = orighe;
+while(listele--) he = he->next;
+return he;
 }
 
 //执行渐进式rehash
