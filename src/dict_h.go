@@ -1,6 +1,9 @@
 package src
 
-import "unsafe"
+import (
+	"math/rand"
+	"unsafe"
+)
 
 const (
 	DICT_OK  = 0
@@ -31,13 +34,13 @@ type dictType struct {
 }
 
 type dict struct {
-	typei dictType
+	typei *dictType
 
 	httable *[2]int
 	ht_table [2]*[]*dictEntry//TODO ht_table[0] = [(1<<exp)]*dictEntry，用切片代替未定大小的数组
 	ht_used  [2]uint64 //[]*dictEntry已用个数
 
-	rehashidx int64 /* rehashing not in progress if rehashidx == -1 */
+	rehashidx int64 /* rehashidx == -1 表示当前没进行rehash */
 
 	/* Keep small vars at end for optimal (minimal) struct padding */
 	pauserehash int16_t /* 如果>0，则rehash暂停了，（<0代表程序写错了） */
@@ -50,12 +53,19 @@ type dict struct {
 type dictIterator struct {
 	d *dict
 	index int64
-	table int//取值0 或 1
-	safe bool
+	table int //取值0 或 1，表示当前在遍历旧table 还是 新table
+	safe bool //是否开启安全模式
 	entry, nextEntry *dictEntry//迭代器当前指向的entry和下一个entry
 	/* unsafe iterator fingerprint for misuse detection. */
 	fingerprint uint64//当前字典d的指纹
 }
+
+type dictScanFunction func(private unsafe.Pointer, de *dictEntry)
+type dictScanBucketFunction func(d *dict, bucketref **dictEntry)
+
+/* hash table的初始化大小 */
+const DICT_HT_INITIAL_EXP = 2
+const DICT_HT_INITIAL_SIZE = 1<<(DICT_HT_INITIAL_EXP)
 
 type dictEntry struct {
 	key unsafe.Pointer
@@ -80,6 +90,7 @@ func dictSize(d *dict) uint64 {
 func dictIsRehashing(d *dict) bool {
 	return d.rehashidx != -1
 }
+//返回key的hash值
 func dictHashKey(d *dict, key unsafe.Pointer) uint64_t {
 	return d.typei.hashFunction(key)
 }
@@ -106,6 +117,18 @@ func dictFreeVal(d *dict, entry *dictEntry) {
 
 func dictGetVal(he *dictEntry) unsafe.Pointer {
 	return he.v.val
+}
+
+func randomULong() uint64 {
+	if ULONG_MAX >= 0xffffffffffffffff {
+		return uint64(rand.Int63())
+	}
+
+	return uint64(random())
+}
+
+func dictSlots(d *dict) uint64 {//新旧两个table的bucket个数总和
+	return DICTHT_SIZE(d.ht_size_exp[0]) + DICTHT_SIZE(d.ht_size_exp[1])
 }
 
 func DICTHT_SIZE(exp int8) uint64 {//返回字典的实际大小，由exp计算得出
