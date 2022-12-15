@@ -10,17 +10,20 @@ const (
 	DICT_ERR = 1
 )
 
-type dictTypeI interface {
-	hashFunction(key unsafe.Pointer) uint64_t //redis用的是MurMurHash2
-	keyDup(d *dict, key unsafe.Pointer) unsafe.Pointer
-	valDup(d *dict, obj unsafe.Pointer) unsafe.Pointer
-	keyCompare(d *dict, key1 unsafe.Pointer, keys unsafe.Pointer) int
-	keyDestructor(d *dict, key unsafe.Pointer)
-	valDestructor(d *dict, obj unsafe.Pointer)
-	expandAllowed(moreMem size_t, usedRatio float64) int
-	/* 允许dictEntry有由调用者定义的metadata，当dictEntry创建时，额外的metadata内存空间被初始化为0 */
-	dictEntryMetadataBytes(d *dict) size_t
+type dictEntry struct {
+	key unsafe.Pointer
+	v   struct {
+		val unsafe.Pointer//interface{}? todo
+		u64 uint64_t
+		s64 int64_t
+		d   float64
+	}
+	next     *dictEntry        /* Next entry in the same hash bucket. */
+	metadata *[]unsafe.Pointer /* An arbitrary number of bytes (starting at a
+	 * pointer-aligned address) of size as returned
+	 * by dictType's dictEntryMetadataBytes(). */
 }
+
 type dictType struct {
 	hashFunction  func(key unsafe.Pointer) uint64_t //redis用的是MurMurHash2
 	keyDup        func(d *dict, key unsafe.Pointer) unsafe.Pointer
@@ -33,12 +36,27 @@ type dictType struct {
 	dictEntryMetadataBytes func(d *dict) size_t
 }
 
+func DICTHT_SIZE(exp int8) uint64 {//返回字典的实际大小，由exp计算得出
+	if exp == -1 {
+		return 0
+	}
+
+	return 1 << exp
+}
+
+func DICTHT_SIZE_MASK(exp int8) uint64 {
+	if exp == -1 {
+		return 0
+	}
+
+	return DICTHT_SIZE(exp) - 1
+}
+
 type dict struct {
 	typei *dictType
 
-	httable *[2]int
 	ht_table [2]*[]*dictEntry//TODO ht_table[0] = [(1<<exp)]*dictEntry，用切片代替未定大小的数组
-	ht_used  [2]uint64 //[]*dictEntry已用个数
+	ht_used  [2]uint64 //[]*dictEntry已有*dictEntry个数
 
 	rehashidx int64 /* rehashidx == -1 表示当前没进行rehash */
 
@@ -56,8 +74,8 @@ type dictIterator struct {
 	table int //取值0 或 1，表示当前在遍历旧table 还是 新table
 	safe bool //是否开启安全模式
 	entry, nextEntry *dictEntry//迭代器当前指向的entry和下一个entry
-	/* unsafe iterator fingerprint for misuse detection. */
-	fingerprint uint64//当前字典d的指纹
+
+	fingerprint uint64//当前字典d的指纹，当iter是非安全模式时，该字段用于误用检测
 }
 
 type dictScanFunction func(private unsafe.Pointer, de *dictEntry)
@@ -67,21 +85,24 @@ type dictScanBucketFunction func(d *dict, bucketref **dictEntry)
 const DICT_HT_INITIAL_EXP = 2
 const DICT_HT_INITIAL_SIZE = 1<<(DICT_HT_INITIAL_EXP)
 
-type dictEntry struct {
-	key unsafe.Pointer
-	v   struct {
-		val unsafe.Pointer
-		u64 uint64_t
-		s64 int64_t
-		d   float64
+
+
+/***** C里的宏定义 ********/
+
+func dictFreeVal(d *dict, entry *dictEntry) {
+	if d.typei.valDestructor != nil {
+		d.typei.valDestructor(d, entry.v.val)
 	}
-	next     *dictEntry        /* Next entry in the same hash bucket. */
-	metadata *[]unsafe.Pointer /* An arbitrary number of bytes (starting at a
-	 * pointer-aligned address) of size as returned
-	 * by dictType's dictEntryMetadataBytes(). */
 }
 
-/***** C里的宏指令 ********/
+func dictSetVal(d *dict, entry *dictEntry, _val_ unsafe.Pointer) {
+	if d.typei.valDup != nil {
+		entry.v.val = d.typei.valDup(d, _val_)
+	} else {
+		entry.v.val = _val_
+	}
+}
+
 
 func dictSize(d *dict) uint64 {
 	return (*d).ht_used[0] + (*d).ht_used[1]
@@ -109,11 +130,6 @@ func dictFreeKey(d *dict, entry *dictEntry) {
 	}
 }
 
-func dictFreeVal(d *dict, entry *dictEntry) {
-	if d.typei.valDestructor != nil {
-		d.typei.valDestructor(d, entry.v.val)
-	}
-}
 
 func dictGetVal(he *dictEntry) unsafe.Pointer {
 	return he.v.val
@@ -129,22 +145,6 @@ func randomULong() uint64 {
 
 func dictSlots(d *dict) uint64 {//新旧两个table的bucket个数总和
 	return DICTHT_SIZE(d.ht_size_exp[0]) + DICTHT_SIZE(d.ht_size_exp[1])
-}
-
-func DICTHT_SIZE(exp int8) uint64 {//返回字典的实际大小，由exp计算得出
-	if exp == -1 {
-		return 0
-	}
-
-	return 1 << exp
-}
-
-func DICTHT_SIZE_MASK(exp int8) uint64 {
-	if exp == -1 {
-		return 0
-	}
-
-	return DICTHT_SIZE(exp) - 1
 }
 
 func dictPauseRehashing(d *dict) {
